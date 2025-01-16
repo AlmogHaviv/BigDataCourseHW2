@@ -3,11 +3,15 @@ package bigdatacourse.hw2.studentcode;
 import java.nio.file.Paths;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
 import com.datastax.oss.driver.api.core.CqlSession;
+import com.datastax.oss.driver.api.core.cql.AsyncResultSet;
 import com.datastax.oss.driver.api.core.cql.BoundStatement;
 import com.datastax.oss.driver.api.core.cql.PreparedStatement;
 import com.datastax.oss.driver.api.core.cql.ResultSet;
@@ -157,69 +161,159 @@ public class HW2StudentAnswer implements HW2API{
 
 	@Override
 	public void loadItems(String pathItemsFile) throws Exception {
-	
-		// Read the JSON file
-        BufferedReader reader = new BufferedReader(new FileReader(new File(pathItemsFile)));
-        String line;
+	    int maxThreads = 240; // Number of threads to use
+	    ExecutorService executor = Executors.newFixedThreadPool(maxThreads);
 
-        while ((line = reader.readLine()) != null) {
-            // Parse each line as a JSONObject
-            JSONObject item = new JSONObject(line);
+	    // Start timing the operation
+	    int totalLines = 0;
 
-            // Extract fields from JSON
-            String asin = item.getString("asin");
-            String title = item.optString("title", null); // title might be missing in some entries
-            String image = item.optString("imUrl", null);
-            String description = item.optString("description", null); 
-            
-            // Extract categories and convert them into a Set
-            Set<String> categories = new HashSet<>();
-            JSONArray categoriesArray = item.getJSONArray("categories");
-            for (int j = 0; j < categoriesArray.length(); j++) {
-                JSONArray categoryList = categoriesArray.getJSONArray(j);
-                for (int k = 0; k < categoryList.length(); k++) {
-                    categories.add(categoryList.getString(k));
-                }
-            }
-            
-            // Prepare the bind values for the insert statement
-            BoundStatement bstmt = pstmtInsertItem.bind(asin, title, image, categories, description);
-            session.execute(bstmt);
-        }
-        
-        System.out.println("Inserted");
-	}
+	    try (BufferedReader reader = new BufferedReader(new FileReader(new File(pathItemsFile)))) {
+	        String line;
 
-	@Override
-	public void loadReviews(String pathReviewsFile) throws Exception {
-		// Read the JSON file
-	    BufferedReader reader = new BufferedReader(new FileReader(new File(pathReviewsFile)));
-	    String line;
+	        while ((line = reader.readLine()) != null) {
+	            final String jsonLine = line; // Make line effectively final for lambda use
+	            executor.execute(() -> {
+	                try {
+	                    // Parse each line as a JSONObject
+	                    JSONObject item = new JSONObject(jsonLine);
 
-	    while ((line = reader.readLine()) != null) {
-	        // Parse each line as a JSONObject
-	        JSONObject review = new JSONObject(line);
+	                    // Extract fields from JSON
+	                    String asin = item.getString("asin");
+	                    String title = item.optString("title", null);
+	                    String image = item.optString("imUrl", null);
+	                    String description = item.optString("description", null);
 
-	        // Extract fields from JSON
-	        String reviewerID = review.getString("reviewerID");
-	        String asin = review.getString("asin");
-	        String reviewerName = review.optString("reviewerName", null);
-	        float overall = (float) review.optDouble("overall", 0);
-	        String description = review.optString("reviewText", null);
-	        String summary = review.optString("summary", null);
-	        long unixReviewTime = review.getLong("unixReviewTime");
+	                    // Extract categories and convert them into a Set
+	                    Set<String> categories = new HashSet<>();
+	                    JSONArray categoriesArray = item.getJSONArray("categories");
+	                    for (int j = 0; j < categoriesArray.length(); j++) {
+	                        JSONArray categoryList = categoriesArray.getJSONArray(j);
+	                        for (int k = 0; k < categoryList.length(); k++) {
+	                            categories.add(categoryList.getString(k));
+	                        }
+	                    }
 
-	        // Prepare the bind values for the insert statement for the first table: TABLE_BY_REVIEWER
-	        BoundStatement bstmtReviewer = pstmtInsertReviewer.bind(reviewerID, unixReviewTime, asin, reviewerName, overall, description, summary);
-	        session.execute(bstmtReviewer);
+	                    // Prepare and execute insert statement conditionally
+	                    BoundStatement bstmt = pstmtInsertItem.bind(asin);
+	                    if (title != null && !title.isEmpty()) {
+	                        bstmt = bstmt.setString("title", title);
+	                    }
+	                    if (image != null && !image.isEmpty()) {
+	                        bstmt = bstmt.setString("image", image);
+	                    }
+	                    if (description != null && !description.isEmpty()) {
+	                        bstmt = bstmt.setString("description", description);
+	                    }
 
-	        // Prepare the bind values for the insert statement for the second table: TABLE_BY_ITEMID
-	        BoundStatement bstmtItemReview = pstmtInsertItemReview.bind(asin, unixReviewTime, reviewerID, reviewerName, overall, description, summary);
-	        session.execute(bstmtItemReview);
+	                    // Now categories would be handled similarly
+	                    if (categories != null && !categories.isEmpty()) {
+	                        bstmt = bstmt.setSet("categories", categories);
+	                    }
+
+	                    // Execute asynchronously and wait for completion
+	                    CompletableFuture<AsyncResultSet> future = session.executeAsync(bstmt).toCompletableFuture();
+	                    future.join();
+
+	                } catch (Exception e) {
+	                    e.printStackTrace();
+	                }
+	            });
+	            totalLines++;
+	        }
 	    }
 
-	    System.out.println("Inserted reviews into the tables");
+	    // Shutdown the executor and wait for all tasks to finish
+	    executor.shutdown();
+	    executor.awaitTermination(1, TimeUnit.HOURS);
+
+	    // End timing and print the total time taken
+	    System.out.println("Total lines inserted: " + totalLines);
 	}
+
+	
+	
+	@Override
+	public void loadReviews(String pathReviewsFile) throws Exception {
+	    int maxThreads = 240; // Number of threads to use
+	    ExecutorService executor = Executors.newFixedThreadPool(maxThreads);
+
+	    int totalLines = 0;
+
+	    try (BufferedReader reader = new BufferedReader(new FileReader(new File(pathReviewsFile)))) {
+	        String line;
+
+	        while ((line = reader.readLine()) != null) {
+	            final String jsonLine = line; // Make line effectively final
+	            executor.execute(() -> {
+	                try {
+	                    // Parse each line as a JSONObject
+	                    JSONObject review = new JSONObject(jsonLine);
+
+	                    // Extract fields from JSON
+	                    String reviewerID = review.getString("reviewerID");
+	                    String asin = review.getString("asin");
+	                    String reviewerName = review.optString("reviewerName", null);
+	                    float overall = (float) review.optDouble("overall", 0);
+	                    String description = review.optString("reviewText", null);
+	                    String summary = review.optString("summary", null);
+	                    long unixReviewTime = review.getLong("unixReviewTime");
+
+	                    // Prepare the bound statement for inserting into the 'reviewers' table
+	                    BoundStatement bstmtReviewer = pstmtInsertReviewer.bind(reviewerID, unixReviewTime, asin);
+
+	                    // Conditionally set fields in the prepared statement
+	                    if (reviewerName != null && !reviewerName.isEmpty()) {
+	                        bstmtReviewer = bstmtReviewer.setString("reviewerName", reviewerName);
+	                    }
+	                    if (overall != 0) {
+	                        bstmtReviewer = bstmtReviewer.setFloat("overall", overall);
+	                    }
+	                    if (description != null && !description.isEmpty()) {
+	                        bstmtReviewer = bstmtReviewer.setString("description", description);
+	                    }
+	                    if (summary != null && !summary.isEmpty()) {
+	                        bstmtReviewer = bstmtReviewer.setString("summary", summary);
+	                    }
+
+	                    // Prepare async insert statement for the 'items' reviews table
+	                    BoundStatement bstmtItemReview = pstmtInsertItemReview.bind(asin, unixReviewTime, reviewerID);
+
+	                    // Conditionally set fields in the prepared statement
+	                    if (reviewerName != null && !reviewerName.isEmpty()) {
+	                        bstmtItemReview = bstmtItemReview.setString("reviewerName", reviewerName);
+	                    }
+	                    if (overall != 0) {
+	                        bstmtItemReview = bstmtItemReview.setFloat("overall", overall);
+	                    }
+	                    if (description != null && !description.isEmpty()) {
+	                        bstmtItemReview = bstmtItemReview.setString("description", description);
+	                    }
+	                    if (summary != null && !summary.isEmpty()) {
+	                        bstmtItemReview = bstmtItemReview.setString("summary", summary);
+	                    }
+
+	                    // Execute both insert statements asynchronously and wait for completion
+	                    CompletableFuture<AsyncResultSet> future1 = session.executeAsync(bstmtReviewer).toCompletableFuture();
+	                    CompletableFuture<AsyncResultSet> future2 = session.executeAsync(bstmtItemReview).toCompletableFuture();
+
+	                    CompletableFuture.allOf(future1, future2).join();
+
+	                } catch (Exception e) {
+	                    e.printStackTrace();
+	                }
+	            });
+	            totalLines++;
+	        }
+	    }
+
+	    // Shutdown the executor and wait for all tasks to finish
+	    executor.shutdown();
+	    executor.awaitTermination(1, TimeUnit.HOURS);
+
+	    // End timing and print the total time taken
+	    System.out.println("Total lines inserted: " + totalLines);
+	}
+
 
 	@Override
 	public String item(String asin) {
